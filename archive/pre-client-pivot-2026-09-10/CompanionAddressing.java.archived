@@ -1,0 +1,84 @@
+package ru.nagumo.verity.server.companion;
+
+import net.minecraft.world.phys.Vec3;
+import ru.nagumo.verity.common.entity.CompanionEntity;
+
+import java.util.Map;
+import java.util.UUID;
+import java.util.regex.Pattern;
+
+/**
+ * Определение адресата обращения (раздел 2/2.1 ТЗ, СТАРАЯ многопользовательская
+ * версия ТЗ): по тексту реплики (голос после STT либо текстовое сообщение) и позиции
+ * говорящего/пишущего ищет, к какому компаньону среди тех, что реально находятся
+ * рядом, обратились по имени. Работал так: любой игрок мог обратиться к ЛЮБОМУ
+ * компаньону поблизости, назвав его текущее имя — не только владелец.
+ *
+ * УДАЛЕНО из проекта в Milestone 1 (10.09.2026) при переходе на приватного
+ * клиентского компаньона — общение стало всегда приватным (владелец ↔ его
+ * компаньон), многопользовательская адресация больше не нужна архитектурно.
+ * Заархивировано целиком (без изменений) на случай, если публичный/видимый режим
+ * компаньона для нескольких игроков понадобится в будущем (см. docs/SPEC.md, раздел
+ * "не блокирующие идеи на будущее").
+ */
+public final class CompanionAddressing {
+
+    private CompanionAddressing() {
+    }
+
+    /**
+     * Найти компаньона, к которому обратились в {@code text}, среди тех, чья сущность
+     * сейчас в мире не дальше {@code maxDistance} от {@code fromPos}.
+     *
+     * @param registry    реестр компаньонов сервера
+     * @param fromPos     позиция говорящего/пишущего в момент реплики
+     * @param text        текст реплики (голос — после STT; текст — как есть)
+     * @param maxDistance дистанция обращения (раздел 2 ТЗ: 16 блоков по умолчанию для
+     *                    текста, дальность SVC — {@code max_voice_distance}, по
+     *                    умолчанию 48 блоков в конфиге этого проекта — для голоса)
+     * @return UUID владельца адресованного компаньона, либо {@code null}, если по
+     *         имени и дистанции никого не нашли — значит, реплика не была обращена
+     *         ни к одному компаньону, отвечать не нужно.
+     */
+    public static UUID resolve(CompanionRegistry registry, Vec3 fromPos, String text, double maxDistance) {
+        if (text == null || text.isBlank() || fromPos == null) {
+            return null;
+        }
+
+        double maxDistSqr = maxDistance * maxDistance;
+        UUID best = null;
+        double bestDistSqr = Double.MAX_VALUE;
+
+        for (Map.Entry<UUID, CompanionData> entry : registry.all()) {
+            CompanionEntity entity = entry.getValue().getEntity();
+            if (entity == null) {
+                continue; // компаньон сейчас не заспавнен (владелец офлайн) — не может быть адресатом
+            }
+            double distSqr = entity.position().distanceToSqr(fromPos);
+            if (distSqr > maxDistSqr) {
+                continue;
+            }
+            if (!mentionsName(text, entry.getValue().getName())) {
+                continue;
+            }
+            if (distSqr < bestDistSqr) {
+                best = entry.getKey();
+                bestDistSqr = distSqr;
+            }
+        }
+        return best;
+    }
+
+    /**
+     * Имя встречается в тексте как отдельное слово (границы слова, без учёта регистра,
+     * с поддержкой кириллицы) — а не как часть более длинного слова.
+     */
+    private static boolean mentionsName(String text, String name) {
+        if (name == null || name.isBlank()) {
+            return false;
+        }
+        Pattern pattern = Pattern.compile("\\b" + Pattern.quote(name) + "\\b",
+                Pattern.CASE_INSENSITIVE | Pattern.UNICODE_CASE | Pattern.UNICODE_CHARACTER_CLASS);
+        return pattern.matcher(text).find();
+    }
+}

@@ -1,0 +1,17 @@
+{
+  "schemaVersion": 1,
+  "id": "nagumo",
+  "version": "${version}",
+  "name": "НАГУМО ИИ",
+  "description": "Клиентская часть ИИ-компаньона: отображение анимаций, звука и текста от сервера. Вся логика ИИ находится на сервере (раздел 3 ТЗ, docs/SPEC.md).",
+  "authors": ["Danil"],
+  "environment": "client",
+  "entrypoints": {
+    "client": ["ru.nagumo.verity.client.VerityClient"]
+  },
+  "depends": {
+    "fabricloader": ">=0.19.3",
+    "minecraft": "26.2",
+    "fabric-api": "*"
+  }
+}

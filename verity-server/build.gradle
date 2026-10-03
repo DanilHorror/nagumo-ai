@@ -1,0 +1,88 @@
+dependencies {
+    implementation project(":verity-common")
+    // Общие сетевые классы должны попасть в jar сервера (jar-in-jar),
+    // иначе на рантайне NoClassDefFoundError (раздел 9 ТЗ).
+    include project(":verity-common")
+
+    // Simple Voice Chat — ВОССТАНОВЛЕНО (откат 11.09.2026, см. ТЗ/archive).
+    // Только verity-server реально использует классы voicechat-api (NagumoVoicechatPlugin,
+    // раздел 5/11 ТЗ) — раньше (до отката) эта зависимость была в общем dependencies{}
+    // блоке всех трёх subprojects в корневом build.gradle; теперь она объявлена только
+    // здесь, т.к. verity-client больше не ссылается ни на один класс voicechat-api
+    // (клиентский голосовой пайплайн заархивирован, HUD/настройки его не используют).
+    // Обычная библиотека (без fabric.mod.json внутри jar-а), поэтому implementation,
+    // а не modImplementation. На рантайме классы приходят из самого мода SVC (см.
+    // modRuntimeOnly ниже), в собранный jar сервера не бандлится.
+    implementation "de.maxhenkel.voicechat:voicechat-api:${project.voicechat_api_version}"
+
+    // Сам мод SVC — для dev-запуска runServer (без него плагин не грузится, только
+    // API-типы) И для реального использования на сервере (голосовой пайплайн реально
+    // общается с игроками через SVC, раздел 5 ТЗ). Игрокам ставится отдельно, но на
+    // СЕРВЕРЕ этот мод обязателен (жёсткий depends в fabric.mod.json, не soft) — без
+    // него голосовому пайплайну неоткуда брать микрофонные пакеты.
+    modRuntimeOnly "maven.modrinth:simple-voice-chat:fabric-${project.voicechat_version}"
+}
+
+processResources {
+    inputs.property "version", project.version
+    filesMatching("fabric.mod.json") {
+        expand "version": project.version
+    }
+}
+
+// Dev-only фикс (см. plan.md, этап 1): после ./gradlew clean (в т.ч. clean build)
+// или на самом первом запуске с чистого run/ каталога Minecraft создаёт eula.txt/
+// server.properties заново со своими дефолтами (eula=false, online-mode=true,
+// enforce-secure-profile=true) — сервер тут же падает на "You need to agree to the EULA"
+// или не пускает неавторизованный dev-клиент. Этот таск чинит оба файла ДО запуска
+// сервера каждый раз, так что руками восстанавливать их больше не нужно.
+tasks.register("fixDevServerConfig") {
+    group = "nagumo dev"
+    description = "Восстанавливает eula.txt=true и online-mode=false/enforce-secure-profile=false " +
+            "в verity-server/run/ перед запуском dev-сервера (эти настройки сбрасываются " +
+            "Minecraft'ом до дефолтных при любом clean или первом запуске с нуля)."
+
+    doLast {
+        def runDir = new File(projectDir, "run")
+        runDir.mkdirs()
+
+        def eulaFile = new File(runDir, "eula.txt")
+        eulaFile.text = "#By changing the setting below to TRUE you are indicating your agreement to our EULA (https://aka.ms/MinecraftEULA).\n" +
+                "eula=true\n"
+
+        def devOverrides = ["online-mode": "false", "enforce-secure-profile": "false"]
+        def propsFile = new File(runDir, "server.properties")
+
+        if (propsFile.exists()) {
+            def seenKeys = [] as Set
+            def newLines = propsFile.readLines().collect { line ->
+                def eq = line.indexOf('=')
+                def key = eq > 0 ? line.substring(0, eq) : null
+                if (key != null && devOverrides.containsKey(key)) {
+                    seenKeys << key
+                    return "${key}=${devOverrides[key]}"
+                }
+                return line
+            }
+            devOverrides.each { key, value ->
+                if (!seenKeys.contains(key)) {
+                    newLines << "${key}=${value}"
+                }
+            }
+            propsFile.text = newLines.join(System.lineSeparator()) + System.lineSeparator()
+        } else {
+            // Файла ещё нет (самый первый запуск/сразу после clean) — пишем минимальный
+            // набор, остальные ключи Minecraft сам допишет дефолтами при старте, наши
+            // два значения при этом сохранятся как есть.
+            propsFile.text = devOverrides.collect { k, v -> "${k}=${v}" }.join(System.lineSeparator()) +
+                    System.lineSeparator()
+        }
+
+        logger.lifecycle("[nagumo] dev-конфиг сервера проверен: eula=true, online-mode=false, " +
+                "enforce-secure-profile=false (verity-server/run/).")
+    }
+}
+
+tasks.matching { it.name == "runServer" }.configureEach {
+    dependsOn "fixDevServerConfig"
+}

@@ -1,0 +1,158 @@
+package ru.nagumo.verity.client.voice;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import javax.sound.sampled.AudioFormat;
+import javax.sound.sampled.AudioSystem;
+import javax.sound.sampled.DataLine;
+import javax.sound.sampled.LineUnavailableException;
+import javax.sound.sampled.TargetDataLine;
+
+/**
+ * Прямой захват микрофона через {@code javax.sound.sampled} (раздел 5/11 ТЗ, шаг 4).
+ *
+ * *Находка (раздел 11 ТЗ, шаг 3):* исследовал voicechat-api 2.6.20 тем же способом,
+ * каким в Milestone 1 разбирался {@code HudElementRegistry} — по содержимому jar-а.
+ * {@code MicrophonePacketEvent} implements {@code PacketEvent}, который implements
+ * {@code ServerEvent} (его {@code getVoicechat()} возвращает {@code VoicechatServerApi})
+ * — событие реально стреляет ТОЛЬКО на сервере, когда он получает уже отправленный по
+ * сети Opus-пакет от клиента. {@code VoicechatClientApi} (клиентская сторона) даёт
+ * только опросные методы состояния ({@code isTalking}, {@code isMuted},
+ * {@code isPushToTalkKeyPressed}) и создание ВЫХОДНЫХ (playback) аудио-каналов — НИ
+ * ОДНОГО способа подписаться на сырой микрофонный поток САМОГО игрока на клиенте в
+ * этой версии API нет. Даже если плагин зарегистрирует слушатель на
+ * {@code MicrophonePacketEvent} из клиентского entrypoint, событие никогда не
+ * произойдёт в клиентском JVM — сама SVC отправляет микрофон по сети и генерирует
+ * это событие только в серверном коде.
+ *
+ * Альтернатива (это и есть выбранное решение): прямой захват через
+ * {@link TargetDataLine} — обычный JDK API, без внешних зависимостей, независимо от
+ * того, установлен ли у игрока Simple Voice Chat вообще. Раздел 5 ТЗ и так
+ * предусматривал этот путь как fallback ("если SVC не установлен — нужен
+ * собственный захват микрофона") — раз переиспользовать SVC для ЭТОЙ задачи
+ * невозможно ни при каких условиях в этой версии API, этот fallback стал
+ * единственным путём, а не запасным.
+ *
+ * Формат — 48 кГц/16 бит/моно/little-endian, тот же, что раньше шёл с SVC-декодера
+ * (Opus decode давал именно такой PCM) — так {@link UtteranceDetector} и
+ * {@link SilenceTrimmer} остаются полностью без изменений (см. javadoc задачи).
+ *
+ * ВАЖНОЕ АРХИТЕКТУРНОЕ ОТЛИЧИЕ ОТ СТАРОГО ПАЙПЛАЙНА (не описано в ТЗ явно, решение
+ * принято здесь): раньше SVC сама решала, когда слать пакеты — только пока зажата
+ * кнопка голоса / сработала её voice-activation, поэтому "пауза между пакетами" в
+ * {@link UtteranceDetector} однозначно означала "речь закончилась". С прямым
+ * захватом {@link TargetDataLine} микрофон отдаёт НЕПРЕРЫВНЫЙ поток вне зависимости
+ * от того, говорит ли игрок — без изменения кода {@link UtteranceDetector} (что
+ * прямо запрещено задачей) его сегментация по паузам сломалась бы (пауз в потоке
+ * попросту никогда не было бы). Решение: этот класс сам отбрасывает "тихие" фреймы
+ * ПЕРЕД тем как передать их в {@link UtteranceDetector#feed}, тем самым воссоздавая
+ * контракт "фрейм приходит только когда есть речь", которого раньше добивалась сама
+ * SVC. Порог — {@link #GATE_RMS_THRESHOLD}, той же шкалы и того же значения, что и
+ * {@code SilenceTrimmer.SPEECH_RMS_THRESHOLD} (300.0) — разумная отправная точка,
+ * почти наверняка потребует подстройки на реальном микрофоне (ровно как в своё время
+ * потребовал подстройки порог самого {@link SilenceTrimmer}, см. память проекта).
+ */
+public final class MicrophoneCapture {
+
+    private static final Logger LOGGER = LoggerFactory.getLogger("nagumo");
+
+    private static final float SAMPLE_RATE = 48_000f;
+    private static final int FRAME_SAMPLES = 960; // 20 мс при 48 кГц — тот же кадр, что раньше давал SVC/Opus
+
+    /** Тот же порядок величины, что и SilenceTrimmer.SPEECH_RMS_THRESHOLD — см. javadoc класса. */
+    private static final double GATE_RMS_THRESHOLD = 300.0;
+
+    /** Зовётся на каждый фрейм, где обнаружена речь (после RMS-гейта). */
+    public interface FrameListener {
+        void onFrame(short[] frame, long nowMs);
+    }
+
+    private TargetDataLine line;
+    private Thread captureThread;
+    private volatile boolean running;
+
+    /** @return true, если захват реально запущен (микрофон доступен и открыт). */
+    public synchronized boolean start(FrameListener listener) {
+        if (running) {
+            return true;
+        }
+        AudioFormat format = new AudioFormat(SAMPLE_RATE, 16, 1, true, false);
+        DataLine.Info info = new DataLine.Info(TargetDataLine.class, format);
+        if (!AudioSystem.isLineSupported(info)) {
+            LOGGER.warn("[NAGUMO-VOICE] микрофон не поддерживает формат 48кГц/16бит/моно — захват недоступен");
+            return false;
+        }
+        try {
+            line = (TargetDataLine) AudioSystem.getLine(info);
+            line.open(format);
+            line.start();
+        } catch (LineUnavailableException | SecurityException e) {
+            LOGGER.warn("[NAGUMO-VOICE] микрофон недоступен ({}) — голосовой ввод компаньона отключён", e.toString());
+            line = null;
+            return false;
+        }
+
+        running = true;
+        captureThread = new Thread(() -> captureLoop(listener), "nagumo-mic-capture");
+        captureThread.setDaemon(true);
+        captureThread.setUncaughtExceptionHandler((t, e) ->
+                LOGGER.error("[NAGUMO-VOICE] необработанное исключение в потоке захвата микрофона: {}", e.getMessage(), e));
+        captureThread.start();
+        LOGGER.info("[NAGUMO-VOICE] захват микрофона запущен ({})", line.getLineInfo());
+        return true;
+    }
+
+    public synchronized void stop() {
+        running = false;
+        if (line != null) {
+            line.stop();
+            line.close();
+            line = null;
+        }
+        captureThread = null; // поток сам выйдет из цикла по running=false и завершится
+    }
+
+    private void captureLoop(FrameListener listener) {
+        byte[] buffer = new byte[FRAME_SAMPLES * 2]; // 16 бит = 2 байта на сэмпл
+        try {
+            while (running) {
+                int read = line.read(buffer, 0, buffer.length); // блокирующий вызов
+                if (read <= 0) {
+                    continue;
+                }
+                short[] frame = bytesToShortsLE(buffer, read);
+                if (rms(frame) >= GATE_RMS_THRESHOLD) {
+                    listener.onFrame(frame, System.currentTimeMillis());
+                }
+            }
+        } catch (Throwable t) {
+            // line.close() из stop() тоже прерывает read() — это ожидаемо при остановке,
+            // не только реальная ошибка, но залогировать в любом случае безопаснее, чем скрыть.
+            if (running) {
+                LOGGER.error("[NAGUMO-VOICE] сбой цикла захвата микрофона: {}", t.getMessage(), t);
+            }
+        }
+    }
+
+    private static short[] bytesToShortsLE(byte[] bytes, int length) {
+        short[] out = new short[length / 2];
+        for (int i = 0; i < out.length; i++) {
+            int lo = bytes[2 * i] & 0xFF;
+            int hi = bytes[2 * i + 1];
+            out[i] = (short) ((hi << 8) | lo);
+        }
+        return out;
+    }
+
+    private static double rms(short[] pcm) {
+        if (pcm.length == 0) {
+            return 0.0;
+        }
+        long sumSquares = 0;
+        for (short s : pcm) {
+            sumSquares += (long) s * s;
+        }
+        return Math.sqrt((double) sumSquares / pcm.length);
+    }
+}

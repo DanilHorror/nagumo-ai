@@ -1,0 +1,111 @@
+plugins {
+    id "fabric-loom" version "1.17.20" apply false
+}
+
+allprojects {
+    group = project.maven_group
+    version = project.mod_version
+
+    repositories {
+        mavenCentral()
+        maven { url "https://maven.fabricmc.net/" }
+
+        // GeckoLib убран (ревизия 10.09.2026, см. ТЗ): компаньон больше не
+        // сущность в мире, GeckoLib-рендер и модель ему не нужны — репозиторий и
+        // зависимость (была ниже, в dependencies{} каждого subproject) удалены вместе.
+
+        // Simple Voice Chat — ВОССТАНОВЛЕН (откат 11.09.2026, см. ТЗ и archive/
+        // server-side-voice-revert-2026-09-10/README.md). Был удалён при переносе
+        // голосового пайплайна на клиент (тот перенос ошибочно тянул за собой и
+        // экономию GPU для будущего LLM, и захват/синтез речи — а GigaAM/Piper лёгкие,
+        // без GPU, и должны были остаться на сервере). MicrophonePacketEvent реально
+        // стреляет ТОЛЬКО на сервере (подтверждено ранее разбором jar-а) — именно
+        // поэтому голосовой пайплайн теперь снова серверный, с SVC как транспортом.
+        maven {
+            name = 'Maxhenkel'
+            url = 'https://maven.maxhenkel.de/repository/public'
+            content { includeGroup 'de.maxhenkel.voicechat' }
+        }
+        // Modrinth-maven — только сам мод SVC для dev-запуска (modRuntimeOnly).
+        maven {
+            name = 'Modrinth'
+            url = 'https://api.modrinth.com/maven'
+            content { includeGroup 'maven.modrinth' }
+        }
+    }
+}
+
+subprojects {
+    apply plugin: "java"
+    apply plugin: "fabric-loom"
+
+    java {
+        toolchain {
+            // MC 26.2 требует Java 25 (piston-meta: javaVersion.majorVersion = 25),
+            // поэтому тулчейн 25, а не 21 из первоначального черновика ТЗ.
+            languageVersion = JavaLanguageVersion.of(25)
+        }
+    }
+
+    tasks.withType(JavaCompile).configureEach {
+        options.encoding = "UTF-8"
+    }
+
+    // MC 26.2 в этом окружении не поставляет intermediary-маппинги (только пустой
+    // артефакт), а сам jar и Fabric API уже в читаемых именах, которые здесь называются
+    // namespace "official". Считаем official == intermediary, а intermediary -> "official"
+    // задаём identity-файлом mappings/identity-v2.tiny (dst namespace тоже "official",
+    // чтобы рантайм-namespace Fabric Loader'а вычислялся как "official").
+    loom {
+        noIntermediateMappings()
+
+        // Явно фиксируем рантайм-namespace = "official" (см. выше + normalize-classtweakers).
+        runs.configureEach {
+            property "fabric.runtimeMappingNamespace", "official"
+        }
+    }
+
+    dependencies {
+        minecraft "com.mojang:minecraft:${project.minecraft_version}"
+        mappings files("${rootDir}/mappings/identity-v2.jar")
+        modImplementation "net.fabricmc:fabric-loader:${project.loader_version}"
+        modImplementation "net.fabricmc.fabric-api:fabric-api:${project.fabric_version}"
+    }
+
+    // Loom при identity-маппинге недетерминированно переписывает namespace части
+    // classTweaker/accessWidener модов Fabric API из "official" в "named", из-за чего
+    // Fabric Loader на dev-запуске падает. Перед запуском приводим namespace всех
+    // ремапнутых модов обратно к "official" (см. tools/normalize-classtweakers.py).
+    tasks.withType(net.fabricmc.loom.task.AbstractRunTask).configureEach {
+        doFirst {
+            def remappedMods = rootProject.file(".gradle/loom-cache/remapped_mods")
+            if (remappedMods.exists()) {
+                def script = rootProject.file("tools/normalize-classtweakers.py").absolutePath
+                def proc = new ProcessBuilder("python", script, remappedMods.absolutePath, "official")
+                        .redirectErrorStream(true)
+                        .start()
+                proc.inputStream.eachLine { logger.lifecycle(it) }
+                if (proc.waitFor() != 0) {
+                    throw new GradleException("normalize-classtweakers.py завершился с ошибкой")
+                }
+
+                // Тот же класс проблемы, другое поле манифеста (обнаружено 11.09.2026 при
+                // откате голосового пайплайна, см. ТЗ/архив): Loom при ремапе мода
+                // simple-voice-chat обнуляет поле "jars" в fabric.mod.json (jar-in-jar
+                // декларацию) — вложенный voicechat-api-2.6.20.jar физически остаётся
+                // внутри, но без объявления Fabric Loader не находит мод "voicechat_api",
+                // от которого жёстко зависит verity-server ("HARD_DEP_NO_CANDIDATE...
+                // voicechat_api"). Восстанавливаем поле после ремапа, перед запуском —
+                // см. tools/fix-svc-jar-in-jar.py.
+                def svcScript = rootProject.file("tools/fix-svc-jar-in-jar.py").absolutePath
+                def svcProc = new ProcessBuilder("python", svcScript, remappedMods.absolutePath)
+                        .redirectErrorStream(true)
+                        .start()
+                svcProc.inputStream.eachLine { logger.lifecycle(it) }
+                if (svcProc.waitFor() != 0) {
+                    throw new GradleException("fix-svc-jar-in-jar.py завершился с ошибкой")
+                }
+            }
+        }
+    }
+}

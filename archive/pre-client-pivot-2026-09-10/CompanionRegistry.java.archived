@@ -1,0 +1,158 @@
+package ru.nagumo.verity.server.companion;
+
+import java.util.HashMap;
+import java.util.Locale;
+import java.util.Map;
+import java.util.Set;
+import java.util.UUID;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ThreadLocalRandom;
+
+/**
+ * Реестр компаньонов на сервере: хранение данных на игрока, генерация дефолтного
+ * позывного (раздел 2 ТЗ) и проверка уникальности имени среди всех компаньонов сервера.
+ * Чистая Java без зависимостей от Minecraft API — низкий риск несовместимости с версией игры.
+ */
+public final class CompanionRegistry {
+
+    /** Валидные пресеты характера (раздел 8 ТЗ). */
+    public static final Set<String> STYLE_PRESETS = Set.of("friendly", "ironic", "business", "reserved");
+    /** Валидные пресеты отношения к посторонним (раздел 8 ТЗ). */
+    public static final Set<String> STRANGER_STYLE_PRESETS = Set.of("friendly", "polite", "wary");
+
+    private static final char[] CONSONANTS = "BCDFGHJKLMNPRSTVWZ".toCharArray();
+    private static final char[] VOWELS = "AEIOU".toCharArray();
+    private static final Map<Character, Character> LEET = Map.of(
+            'E', '3', 'A', '4', 'S', '5', 'I', '1', 'O', '0'
+    );
+
+    private final Map<UUID, CompanionData> companions = new ConcurrentHashMap<>();
+    private final Set<String> usedNamesLowercase = ConcurrentHashMap.newKeySet();
+
+    /** Данные компаньона игрока, если они уже существуют, иначе {@code null} (без создания). */
+    public CompanionData get(UUID playerId) {
+        return companions.get(playerId);
+    }
+
+    /** Вернуть данные компаньона игрока, создав их (с дефолтным позывным) при первом обращении. */
+    public CompanionData getOrCreate(UUID playerId) {
+        return companions.computeIfAbsent(playerId, id -> {
+            String name = generateUniqueDefaultName();
+            usedNamesLowercase.add(name.toLowerCase(Locale.ROOT));
+            return new CompanionData(name);
+        });
+    }
+
+    /**
+     * Итерация по всем компаньонам сервера (владелец → данные) — нужна, чтобы найти,
+     * к какому компаньону среди тех, что реально рядом, обратились по имени (раздел
+     * 2/2.1 ТЗ, см. CompanionAddressing). Только для чтения.
+     */
+    public Iterable<Map.Entry<UUID, CompanionData>> all() {
+        return companions.entrySet();
+    }
+
+    /**
+     * Попытаться переименовать компаньона. Возвращает null при успехе, иначе — текст
+     * причины отказа (имя занято/некорректно), который можно сразу показать игроку.
+     */
+    public String rename(UUID playerId, String newName) {
+        if (newName == null || newName.isBlank() || newName.length() > 16) {
+            return "Имя должно быть от 1 до 16 символов.";
+        }
+        String key = newName.toLowerCase(Locale.ROOT);
+        CompanionData data = companions.get(playerId);
+        String currentKey = data == null ? null : data.getName().toLowerCase(Locale.ROOT);
+        if (!key.equals(currentKey) && usedNamesLowercase.contains(key)) {
+            return "Имя \"" + newName + "\" уже занято другим компаньоном на сервере.";
+        }
+        if (data == null) {
+            companions.put(playerId, new CompanionData(newName));
+        } else {
+            usedNamesLowercase.remove(currentKey);
+            data.setName(newName);
+        }
+        usedNamesLowercase.add(key);
+        return null;
+    }
+
+    private String generateUniqueDefaultName() {
+        for (int attempt = 0; attempt < 100; attempt++) {
+            String candidate = generateDefaultName();
+            if (!usedNamesLowercase.contains(candidate.toLowerCase(Locale.ROOT))) {
+                return candidate;
+            }
+        }
+        // Крайний случай — почти невозможен при разумном числе игроков, но не должен падать.
+        return "N" + (System.nanoTime() % 10000);
+    }
+
+    /**
+     * Генерация позывного в стиле "5H3Y" (раздел 2 ТЗ): 4-5 символов, псевдо-читаемая
+     * заготовка из согласных/гласных, часть букв заменяется на цифры по leet-таблице,
+     * гарантированы минимум одна буква и одна цифра в результате.
+     *
+     * ВАЖНО (раздел 2 ТЗ): "Символы 0/O и 1/I не смешиваются в одном имени". Решение
+     * "заменять эту букву на цифру" принимается один раз на каждую РАЗЛИЧНУЮ букву во
+     * всём имени, а не независимо на каждую позицию — все вхождения одной и той же
+     * буквы заменяются одинаково.
+     *
+     * ПРИМЕЧАНИЕ ПРИ АРХИВИРОВАНИИ (10.09.2026): при переносе этой логики на клиент
+     * (CompanionNameGenerator, Milestone 3) обнаружен и исправлен реальный баг —
+     * ~3.6% генераций не содержали ни одной цифры, потому что согласный пул содержит
+     * только одну leet-годную букву (S) из 18, и заготовка иногда не содержала вообще
+     * ни одной годной для замены буквы. В ЭТОЙ (серверной, архивной) копии баг НЕ
+     * исправлен — исправление есть только в клиентской версии.
+     */
+    private String generateDefaultName() {
+        ThreadLocalRandom random = ThreadLocalRandom.current();
+        int length = 4 + random.nextInt(2); // 4 или 5
+        StringBuilder base = new StringBuilder(length);
+        for (int i = 0; i < length; i++) {
+            char[] pool = (i % 2 == 0) ? CONSONANTS : VOWELS;
+            base.append(pool[random.nextInt(pool.length)]);
+        }
+
+        Map<Character, Boolean> substituteDecision = new HashMap<>();
+        for (int i = 0; i < base.length(); i++) {
+            char c = base.charAt(i);
+            if (LEET.containsKey(c)) {
+                substituteDecision.computeIfAbsent(c, k -> random.nextBoolean());
+            }
+        }
+
+        StringBuilder result = new StringBuilder(length);
+        boolean hasDigit = false;
+        boolean hasLetter = false;
+        for (int i = 0; i < base.length(); i++) {
+            char c = base.charAt(i);
+            if (Boolean.TRUE.equals(substituteDecision.get(c))) {
+                result.append(LEET.get(c));
+                hasDigit = true;
+            } else {
+                result.append(c);
+                hasLetter = true;
+            }
+        }
+
+        if (!hasDigit) {
+            for (int i = 0; i < base.length(); i++) {
+                char c = base.charAt(i);
+                if (LEET.containsKey(c)) {
+                    for (int j = 0; j < base.length(); j++) {
+                        if (base.charAt(j) == c) {
+                            result.setCharAt(j, LEET.get(c));
+                        }
+                    }
+                    hasDigit = true;
+                    break;
+                }
+            }
+        }
+        if (!hasLetter) {
+            result.setCharAt(0, base.charAt(0));
+        }
+
+        return result.toString();
+    }
+}

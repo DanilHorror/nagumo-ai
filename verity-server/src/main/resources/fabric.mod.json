@@ -1,0 +1,19 @@
+{
+  "schemaVersion": 1,
+  "id": "nagumo",
+  "version": "${version}",
+  "name": "NAGUMO AI (сервер)",
+  "description": "Серверная часть ИИ-компаньона — вся логика, промпты и обращения к LLM. НЕ распространяется игрокам (раздел 3 ТЗ, docs/SPEC.md).",
+  "authors": ["Danil"],
+  "environment": "server",
+  "entrypoints": {
+    "main": ["ru.nagumo.verity.server.VerityServer"],
+    "voicechat": ["ru.nagumo.verity.server.voice.NagumoVoicechatPlugin"]
+  },
+  "depends": {
+    "fabricloader": ">=0.19.3",
+    "minecraft": "26.2",
+    "fabric-api": "*",
+    "voicechat_api": ">=2.6.20"
+  }
+}

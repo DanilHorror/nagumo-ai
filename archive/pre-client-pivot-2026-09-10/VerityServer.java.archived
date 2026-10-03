@@ -1,0 +1,140 @@
+package ru.nagumo.verity.server;
+
+import java.util.UUID;
+
+import net.fabricmc.api.ModInitializer;
+import net.fabricmc.fabric.api.networking.v1.ServerPlayConnectionEvents;
+import net.fabricmc.fabric.api.networking.v1.ServerPlayNetworking;
+import net.minecraft.network.chat.Component;
+import net.minecraft.server.level.ServerLevel;
+import net.minecraft.server.level.ServerPlayer;
+import ru.nagumo.verity.common.entity.CompanionEntity;
+import ru.nagumo.verity.common.entity.ModEntities;
+import ru.nagumo.verity.common.network.ChatQueryPayload;
+import ru.nagumo.verity.common.network.NagumoPayloads;
+import ru.nagumo.verity.common.network.ReportInstalledModsPayload;
+import ru.nagumo.verity.common.network.ShowTextPayload;
+import ru.nagumo.verity.server.command.NagumoCommands;
+import ru.nagumo.verity.server.companion.CompanionAddressing;
+import ru.nagumo.verity.server.companion.CompanionData;
+import ru.nagumo.verity.server.companion.CompanionRegistry;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+/**
+ * АРХИВ (10.09.2026) — точка входа серверного мода ДО перехода на приватного
+ * клиентского компаньона (Milestone 1). Тогда компаньон был видимой сущностью в
+ * мире, к которой мог обратиться ЛЮБОЙ игрок поблизости, назвав её текущее имя
+ * (раздел 2/2.1 старой версии ТЗ) — вся адресация и спавн сущности определялись
+ * здесь. Заменено в новой архитектуре: сущности в мире больше нет, адресация не
+ * нужна (общение всегда приватное владелец↔компаньон).
+ */
+public final class VerityServer implements ModInitializer {
+
+    private static final Logger LOGGER = LoggerFactory.getLogger("nagumo");
+
+    /**
+     * Дистанция обращения по тексту (раздел 2 ТЗ): "отдельная конфигурация сервера,
+     * по умолчанию 16 блоков". Пока константа — вынести в нормальный конфиг сервера,
+     * когда он появится (там же, где однажды будут жить прочие серверные настройки).
+     */
+    private static final double TEXT_ADDRESS_RANGE_BLOCKS = 16.0;
+
+    private static CompanionRegistry companions;
+
+    /**
+     * Доступ к реестру компаньонов для кода, который создаётся вне основного графа
+     * зависимостей и которому нельзя передать ссылку через конструктор — прежде
+     * всего {@code NagumoVoicechatPlugin} (его инстанцирует сам Simple Voice Chat
+     * по entrypoint). Возвращает {@code null}, пока сервер не инициализировался.
+     */
+    public static CompanionRegistry companions() {
+        return companions;
+    }
+
+    @Override
+    public void onInitialize() {
+        companions = new CompanionRegistry();
+        NagumoPayloads.registerCommon();
+        // Регистрация типа сущности-компаньона и его атрибутов (этап 2). Должна
+        // вызываться и здесь, и в VerityClient.onInitializeClient() — тем же
+        // паттерном, что и NagumoPayloads.registerCommon().
+        ModEntities.registerCommon();
+        NagumoCommands.register(companions);
+
+        // При входе игрока — создать (если ещё нет) данные его компаньона с дефолтным
+        // позывным и заспавнить видимую сущность рядом с игроком (этап 2).
+        ServerPlayConnectionEvents.JOIN.register((handler, sender, server) -> {
+            ServerPlayer player = handler.getPlayer();
+            CompanionData data = companions.getOrCreate(player.getUUID());
+            spawnCompanion(player, data);
+            player.sendSystemMessage(
+                    Component.literal("Твой ИИ-компаньон теперь с тобой. Его зовут " + data.getName()
+                            + ". Переименовать: /nagumo name <имя>")
+            );
+        });
+
+        // При выходе игрока — убрать сущность его компаньона из мира (этап 2).
+        // Данные компаньона (имя, стиль) остаются в реестре, сущность создаётся
+        // заново при следующем входе.
+        ServerPlayConnectionEvents.DISCONNECT.register((handler, server) -> {
+            CompanionData data = companions.get(handler.getPlayer().getUUID());
+            if (data == null) {
+                return; // не должно происходить в норме, но на всякий случай — не создаём запись впустую
+            }
+            CompanionEntity entity = data.getEntity();
+            if (entity != null) {
+                entity.discard();
+                data.setEntity(null);
+            }
+        });
+
+        // Этап 1: просто логируем список модов (раздел 9 ТЗ) — реальное использование
+        // (подсказки по конкретным модам) появится со слоем прямого поиска (раздел 6.3).
+        ServerPlayNetworking.registerGlobalReceiver(ReportInstalledModsPayload.ID, (payload, context) ->
+                LOGGER.info("Игрок " + context.player().getName().getString()
+                        + " прислал список модов: " + payload.modsData()));
+
+        // Эхо-ответ на ChatQuery без LLM — проверка связки клиент-сервер (этап 1 плана).
+        // Раздел 2 ТЗ: обратиться можно к ЛЮБОМУ компаньону рядом, назвав его текущее
+        // имя — не только к своему. Поэтому сначала определяем адресата по имени и
+        // дистанции (CompanionAddressing), и только если он найден — отвечаем именно
+        // от его лица. Если рядом никого по имени не назвали — реплика не была
+        // обращена к компаньону, и отвечать не нужно.
+        ServerPlayNetworking.registerGlobalReceiver(ChatQueryPayload.ID, (payload, context) -> {
+            ServerPlayer player = context.player();
+            UUID addressedOwner = CompanionAddressing.resolve(
+                    companions, player.position(), payload.text(), TEXT_ADDRESS_RANGE_BLOCKS);
+            if (addressedOwner == null) {
+                return;
+            }
+            CompanionData data = companions.getOrCreate(addressedOwner);
+            CompanionEntity entity = data.getEntity();
+            if (entity == null) {
+                return; // маловероятно: только что нашли компаньона по позиции его сущности
+            }
+            String reply = data.getName() + ": ты написал \"" + payload.text()
+                    + "\" — это заглушка, настоящий ИИ появится на этапе 4.";
+            ServerPlayNetworking.send(player, new ShowTextPayload(entity.getId(), reply));
+        });
+
+        LOGGER.info("NAGUMO AI (verity-server) инициализирован.");
+    }
+
+    /**
+     * Создать сущность компаньона рядом с владельцем, задать владельца и видимое имя
+     * (из {@link CompanionData}), добавить в мир и сохранить ссылку в data.
+     */
+    private static void spawnCompanion(ServerPlayer player, CompanionData data) {
+        ServerLevel level = player.level();
+
+        CompanionEntity entity = new CompanionEntity(ModEntities.COMPANION, level);
+        entity.snapTo(player.getX(), player.getY(), player.getZ(), player.getYRot(), 0.0F);
+        entity.setOwnerPlayer(player);
+        entity.applyDisplayName(data.getName());
+
+        level.addFreshEntity(entity);
+        data.setEntity(entity);
+    }
+}

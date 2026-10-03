@@ -1,0 +1,214 @@
+package ru.nagumo.verity.client.voice;
+
+import net.minecraft.client.Minecraft;
+import net.minecraft.network.chat.Component;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import ru.nagumo.verity.client.config.NagumoClientConfig;
+import ru.nagumo.verity.client.hud.CompanionHud;
+import ru.nagumo.verity.client.hud.CompanionHudState;
+
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ThreadFactory;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.regex.Pattern;
+
+/**
+ * Локальный голосовой конвейер компаньона (раздел 5/11 ТЗ, шаг 4): микрофон
+ * (см. {@link MicrophoneCapture}) → {@link UtteranceDetector} → полная транскрипция
+ * ({@link GigaAmClient}) → проверка имени → эхо-ответ (заглушка вместо brain) →
+ * озвучка ({@link PiperClient} + {@link CompanionVoicePlayback}) → HUD.
+ *
+ * *Решение (не описано явно в ТЗ):* "не делай лёгкий дешёвый первый проход" — раздел
+ * 2 ТЗ описывает двухэтапную схему ИМЕННО как средство не гонять тяжёлую
+ * транскрипцию на КАЖДОГО из МНОГИХ игроков сервера. При одном пользователе (это и
+ * есть новая архитектура) STT гоняется всё равно только на реально произнесённых
+ * репликах (после сегментации по паузам {@link UtteranceDetector}, которая и так
+ * отсекает тишину) — лишней нагрузки от "гонять каждую реплику целиком" по сути нет,
+ * а сложность двухэтапной схемы (отдельный лёгкий движок, свой собственный VAD поверх
+ * уже имеющегося) не окупается на одном пользователе. Задача явно попросила ЭТО
+ * решение описать, а не менять объём молча — считаю двухэтапную схему избыточной для
+ * v1 клиентского пайплайна.
+ *
+ * Управляется явно ({@link #start()}/{@link #stop()}) из {@code VerityClient} по
+ * входу/выходу из мира и из {@code NagumoSettingsCommand} при смене уровня модели —
+ * раздел 11 ТЗ, шаг 6: если компаньон выключен, конвейер не должен активироваться
+ * вообще, а не просто не показывать HUD.
+ */
+public final class VoicePipeline {
+
+    private static final Logger LOGGER = LoggerFactory.getLogger("nagumo");
+
+    private static VoicePipeline instance;
+
+    private final MicrophoneCapture capture = new MicrophoneCapture();
+    private final UtteranceDetector detector = new UtteranceDetector();
+    private final GigaAmClient stt = new GigaAmClient();
+    private final PiperClient piper = new PiperClient();
+
+    /**
+     * Один пул на всю обработку реплики (STT → эхо-текст → TTS → воспроизведение).
+     * Раньше (verity-server) были ОТДЕЛЬНЫЕ пулы под STT и TTS — это было нужно,
+     * чтобы всплеск озвучки одного игрока не голодал STT ДРУГИХ игроков сервера.
+     * У одного локального пользователя это соображение не применяется (упрощение,
+     * не описанное явно в ТЗ) — реплики и так обрабатываются по одной за раз.
+     */
+    private final ExecutorService processingExecutor =
+            Executors.newCachedThreadPool(daemonFactory("nagumo-voice"));
+
+    private final ScheduledExecutorService flusher =
+            Executors.newSingleThreadScheduledExecutor(daemonFactory("nagumo-voice-flush"));
+
+    private volatile boolean running;
+
+    public static synchronized void init() {
+        if (instance == null) {
+            instance = new VoicePipeline();
+        }
+    }
+
+    public static VoicePipeline get() {
+        return instance;
+    }
+
+    public synchronized void start() {
+        if (running) {
+            return;
+        }
+        if (!capture.start(this::onFrame)) {
+            return; // MicrophoneCapture уже залогировал причину
+        }
+        flusher.scheduleWithFixedDelay(this::flushStale, 250, 250, TimeUnit.MILLISECONDS);
+        running = true;
+        LOGGER.info("[NAGUMO-VOICE] голосовой пайплайн компаньона запущен");
+    }
+
+    public synchronized void stop() {
+        if (!running) {
+            return;
+        }
+        capture.stop();
+        running = false;
+        CompanionHud.setState(CompanionHudState.IDLE);
+        LOGGER.info("[NAGUMO-VOICE] голосовой пайплайн компаньона остановлен");
+    }
+
+    private void onFrame(short[] frame, long nowMs) {
+        UtteranceDetector.Utterance utterance = detector.feed(frame, nowMs);
+        if (utterance != null) {
+            processUtterance(utterance);
+        }
+    }
+
+    private void flushStale() {
+        try {
+            UtteranceDetector.Utterance utterance = detector.checkTimeout(System.currentTimeMillis());
+            if (utterance != null) {
+                processUtterance(utterance);
+            }
+        } catch (Throwable t) {
+            LOGGER.error("[NAGUMO-VOICE] сбой планировщика пауз: {}", t.getMessage(), t);
+        }
+    }
+
+    private void processUtterance(UtteranceDetector.Utterance utterance) {
+        processingExecutor.execute(() -> {
+            try {
+                short[] forStt = utterance.forWhisper();
+                if (forStt == null) {
+                    return; // UtteranceDetector уже залогировал причину отброса
+                }
+                short[] pcm16k = PcmResampler.resample(forStt, 48_000, 16_000);
+                String text = stt.transcribe(pcm16k);
+                if (text == null || text.isBlank()) {
+                    LOGGER.info("[NAGUMO-STT] — пусто (gigaam-server недоступен либо вернул пустую строку)");
+                    return;
+                }
+                LOGGER.info("[NAGUMO-STT] текст=\"{}\"", text);
+
+                String name = NagumoClientConfig.get().companionName;
+                if (!mentionsName(text, name)) {
+                    return; // обычная реплика, не обращение к компаньону (раздел 2 ТЗ)
+                }
+                handleAddressed(name, text.trim());
+            } catch (Throwable t) {
+                LOGGER.error("[NAGUMO-STT] ошибка обработки реплики: {}", t.getMessage(), t);
+            }
+        });
+    }
+
+    /**
+     * Раздел 11 ТЗ, шаг 5: "HUD → LISTENING на время обработки, затем THINKING".
+     * Поскольку транскрипция уже завершена к этому моменту (полная STT на каждую
+     * реплику, см. javadoc класса про отказ от двухэтапной схемы), LISTENING здесь —
+     * короткий символический флеш "да, я услышал обращение", а не признак идущей
+     * записи. THINKING — на время построения эхо-ответа и синтеза Piper (в будущем,
+     * с реальным brain, THINKING ляжет на время инференса LLM). Это моя трактовка
+     * порядка состояний, не описанная явно в ТЗ дословно.
+     */
+    private void handleAddressed(String name, String text) {
+        CompanionHud.setState(CompanionHudState.LISTENING);
+        CompanionHud.setState(CompanionHudState.THINKING);
+
+        String reply = name + ": ты сказал \"" + text
+                + "\" — это заглушка, настоящий ИИ появится на следующем шаге.";
+        showText(reply);
+
+        WavUtil.WavData wav = piper.synthesize(reply);
+        if (wav == null) {
+            LOGGER.warn("[NAGUMO-TTS] piper не дал аудио для: \"{}\"", reply);
+            CompanionHud.setState(CompanionHudState.IDLE);
+            return;
+        }
+
+        CompanionHud.setState(CompanionHudState.SPEAKING);
+        CompanionVoicePlayback.play(wav, () -> CompanionHud.setState(CompanionHudState.IDLE));
+    }
+
+    /**
+     * Показ текста компаньона игроку. *Решение (не описано явно в ТЗ):* раньше это
+     * шло через сетевой пакет {@code ShowTextPayload} сервер→клиент; теперь всё
+     * локально на клиенте, отправлять пакет самому себе не имеет смысла — просто
+     * переиспользую тот же способ ОТОБРАЖЕНИЯ, которым уже пользовался обработчик
+     * этого пакета в {@code VerityClient} ({@code player.sendSystemMessage}), без
+     * самого пакета.
+     */
+    private void showText(String text) {
+        Minecraft client = Minecraft.getInstance();
+        client.execute(() -> {
+            if (client.player != null) {
+                client.player.sendSystemMessage(Component.literal(text));
+            }
+        });
+    }
+
+    /**
+     * Имя встречается в тексте как отдельное слово (границы слова, без учёта
+     * регистра, с поддержкой кириллицы) — та же логика, что была в старом
+     * {@code CompanionAddressing.mentionsName}, но теперь сравнение с ОДНИМ именем
+     * вместо перебора реестра компаньонов сервера (раздел 2/11 ТЗ).
+     */
+    private static boolean mentionsName(String text, String name) {
+        if (name == null || name.isBlank()) {
+            return false;
+        }
+        Pattern pattern = Pattern.compile("\\b" + Pattern.quote(name) + "\\b",
+                Pattern.CASE_INSENSITIVE | Pattern.UNICODE_CASE | Pattern.UNICODE_CHARACTER_CLASS);
+        return pattern.matcher(text).find();
+    }
+
+    private static ThreadFactory daemonFactory(String prefix) {
+        AtomicInteger counter = new AtomicInteger();
+        return runnable -> {
+            Thread t = new Thread(runnable, prefix + "-" + counter.incrementAndGet());
+            t.setDaemon(true);
+            t.setUncaughtExceptionHandler((thread, ex) ->
+                    LOGGER.error("[NAGUMO] необработанное исключение в потоке {}: {}",
+                            thread.getName(), ex.getMessage(), ex));
+            return t;
+        };
+    }
+}

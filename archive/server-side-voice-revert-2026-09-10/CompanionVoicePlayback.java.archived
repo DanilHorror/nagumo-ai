@@ -1,0 +1,81 @@
+package ru.nagumo.verity.client.voice;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import javax.sound.sampled.AudioFormat;
+import javax.sound.sampled.AudioInputStream;
+import javax.sound.sampled.AudioSystem;
+import javax.sound.sampled.Clip;
+import javax.sound.sampled.LineEvent;
+import javax.sound.sampled.LineUnavailableException;
+import java.io.ByteArrayInputStream;
+import java.io.IOException;
+
+/**
+ * Озвучка компаньона (раздел 5/11 ТЗ, шаг 4-5): обычный локальный непозиционный
+ * звук, слышимый только владельцу — НЕ через SVC-вещание другим игрокам (раздел 5
+ * ТЗ: "как звук интерфейса", а не позиционное аудио в мире).
+ *
+ * *Архитектурное решение (не описано явно в ТЗ):* старый {@code CompanionVoice} из
+ * verity-server не перенесён (не в списке файлов на перенос) и не мог бы быть
+ * перенесён без переписывания — он целиком построен вокруг
+ * {@code VoicechatServerApi.createEntityAudioChannel} (позиционный канал ПРИВЯЗАННЫЙ
+ * к сущности в мире, которой больше не существует с Milestone 1). Раздел 5 ТЗ прямо
+ * требует другой характер звука ("обычный локальный, непозиционный"), так что это в
+ * любом случае новый код, а не перенос. Реализация — {@code javax.sound.sampled}
+ * (JDK, без внешних зависимостей): PCM от {@link PiperClient} оборачивается в WAV и
+ * проигрывается через {@link Clip} напрямую на системном микшере. Из-за этого звук
+ * идёт МИМО звукового движка Minecraft (OpenAL/SoundManager) — не подчиняется
+ * игровым ползункам громкости и не глохнет вместе с игрой при потере фокуса окна.
+ * Для полноценной интеграции со звуком Minecraft потребовался бы кастомный
+ * {@code SoundInstance}, что выходит за рамки этого прохода ("не делай интеграцию с
+ * движком инференса... это отдельная задача" — по духу того же ограничения
+ * распространяю и на звуковой движок: минимально достаточно для заглушки).
+ */
+public final class CompanionVoicePlayback {
+
+    private static final Logger LOGGER = LoggerFactory.getLogger("nagumo");
+
+    private CompanionVoicePlayback() {
+    }
+
+    /**
+     * Проиграть синтезированную речь. Асинхронное завершение — {@code onDone} зовётся
+     * из потока воспроизведения JavaSound, когда клип реально доиграл (или сразу,
+     * синхронно, если проигрывание вообще не удалось запустить).
+     */
+    public static void play(WavUtil.WavData wav, Runnable onDone) {
+        try {
+            AudioFormat format = new AudioFormat(wav.sampleRate(), 16, 1, true, false);
+            byte[] pcmBytes = shortsToBytesLE(wav.pcm());
+            AudioInputStream stream = new AudioInputStream(
+                    new ByteArrayInputStream(pcmBytes), format, wav.pcm().length);
+
+            Clip clip = AudioSystem.getClip();
+            clip.open(stream);
+            clip.addLineListener(event -> {
+                if (event.getType() == LineEvent.Type.STOP) {
+                    clip.close();
+                    onDone.run();
+                }
+            });
+            clip.start();
+            LOGGER.info("[NAGUMO-TTS] играю озвучку — {} сэмплов {}Гц (~{} мс)",
+                    wav.pcm().length, (int) format.getSampleRate(),
+                    wav.pcm().length * 1000L / (long) wav.sampleRate());
+        } catch (LineUnavailableException | IOException | IllegalArgumentException e) {
+            LOGGER.warn("[NAGUMO-TTS] не удалось воспроизвести озвучку: {}", e.toString());
+            onDone.run();
+        }
+    }
+
+    private static byte[] shortsToBytesLE(short[] pcm) {
+        byte[] out = new byte[pcm.length * 2];
+        for (int i = 0; i < pcm.length; i++) {
+            out[2 * i] = (byte) (pcm[i] & 0xFF);
+            out[2 * i + 1] = (byte) ((pcm[i] >> 8) & 0xFF);
+        }
+        return out;
+    }
+}
